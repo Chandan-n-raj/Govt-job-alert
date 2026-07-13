@@ -1,0 +1,81 @@
+name: govt-job-monitor
+
+on:
+  schedule:
+    - cron: '30 2 * * *'  # 08:00 AM IST (UTC+5:30)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run monitor with retries and logs
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM || '' }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO || '' }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME || '' }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD || '' }}
+          SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS || 'true' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          max_attempts=3
+          attempt=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "Running monitor attempt $attempt of $max_attempts"
+            if python main.py 2>&1 | tee monitor.log; then
+              echo "Monitor completed successfully."
+              break
+            fi
+
+            exit_code=${PIPESTATUS[0]}
+            log_content="$(cat monitor.log)"
+            if echo "$log_content" | grep -Eqi 'ssl|certificate|connection|timed out|dns|temporar|network|NameResolution|Max retries|ConnectionError|SSLError'; then
+              echo "Transient failure detected. Retrying in 30 seconds..."
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                sleep 30
+                attempt=$((attempt + 1))
+                continue
+              fi
+            else
+              echo "Fatal error detected. Stopping after attempt $attempt."
+              exit "$exit_code"
+            fi
+
+            echo "Transient failure persisted after $max_attempts attempts."
+            exit "$exit_code"
+          done
+
+      - name: Commit updated notifications if changed
+        if: success()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- notifications.json; then
+            echo "No changes to notifications.json; skipping commit."
+          else
+            git add notifications.json
+            git commit -m "chore: update notifications [skip ci]"
+            git push
+          fi
